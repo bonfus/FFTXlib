@@ -20,6 +20,8 @@
 #                  You may use this instead of tweaking DFLAGS and FDFLAGS
 #                  BEWARE: will not work for IBM xlf! Manually edit FDFLAGS
 #MANUAL_DFLAGS  = -D__NON_BLOCKING_SCATTER -D__DOUBLE_BUFFER 
+MANUAL_DFLAGS  = -D__RMA_SCATTER -D__DOUBLE_BUFFER -D__RMAv1
+#MANUAL_DFLAGS  = -D__NON_BLOCKING_SCATTER -D__DOUBLE_BUFFER 
 DFLAGS         =  -D__INTEL -D__FFTW -D__MPI -D__PARA -D__SCALAPACK $(MANUAL_DFLAGS)
 FDFLAGS        = $(DFLAGS) $(MANUAL_DFLAGS)
 
