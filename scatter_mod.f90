@@ -1142,6 +1142,406 @@ SUBROUTINE fft_scatter ( dfft, f_in, nr3x, nxx_, f_aux, ncp_, npp_, isgn, dtgs )
 END SUBROUTINE fft_scatter
 #endif 
 ! RMAv1
+!
+#ifdef __RMAv2
+!
+!   RMA SCATTER, should be bad
+!
+!-----------------------------------------------------------------------
+SUBROUTINE fft_scatter ( dfft, f_in, nr3x, nxx_, f_aux, ncp_, npp_, isgn, dtgs )
+  !-----------------------------------------------------------------------
+  !
+  ! transpose the fft grid across nodes
+  ! a) From columns to planes (isgn > 0)
+  !
+  !    "columns" (or "pencil") representation:
+  !    processor "me" has ncp_(me) contiguous columns along z
+  !    Each column has nr3x elements for a fft of order nr3
+  !    nr3x can be =nr3+1 in order to reduce memory conflicts.
+  !
+  !    The transpose take places in two steps:
+  !    1) on each processor the columns are divided into slices along z
+  !       that are stored contiguously. On processor "me", slices for
+  !       processor "proc" are npp_(proc)*ncp_(me) big
+  !    2) all processors communicate to exchange slices
+  !       (all columns with z in the slice belonging to "me"
+  !        must be received, all the others must be sent to "proc")
+  !    Finally one gets the "planes" representation:
+  !    processor "me" has npp_(me) complete xy planes
+  !
+  !  b) From planes to columns (isgn < 0)
+  !
+  !  Quite the same in the opposite direction
+  !
+  !  The output is overwritten on f_in ; f_aux is used as work space
+  !
+  !  If optional argument "dtgs" is present the subroutines performs
+  !  the trasposition using the Task Groups distribution
+  !
+  IMPLICIT NONE
+#if defined(__MPI)
+  INCLUDE 'mpif.h'
+#endif
+
+  TYPE (fft_type_descriptor), INTENT(in) :: dfft
+  INTEGER, INTENT(in)           :: nr3x, nxx_, isgn, ncp_ (:), npp_ (:)
+  COMPLEX (DP), INTENT(inout)   :: f_in (nxx_), f_aux (nxx_)
+  TYPE (task_groups_descriptor), OPTIONAL, INTENT(in) :: dtgs
+
+#if defined(__MPI)
+  ! window definition
+  INTEGER :: WIN, INFO
+  INTEGER(KIND=MPI_ADDRESS_KIND) TARGET_DISP
+  INTEGER (KIND=MPI_ADDRESS_KIND) lowerbound, mp_size
+  !
+  INTEGER :: k, offset, proc, ierr, me, nprocp, gproc, gcomm, i, kdest, kfrom
+  INTEGER :: me_p, nppx, mc, j, npp, nnp, ii, it, ip, ioff, sendsiz, ncpx, ipp, nblk, nsiz, ijp
+  INTEGER :: sh(dfft%nproc), rh(dfft%nproc)
+  INTEGER :: istat( MPI_STATUS_SIZE )
+  !
+  INTEGER, SAVE, ALLOCATABLE :: indmap(:,:)
+  INTEGER, SAVE, ALLOCATABLE :: indmap_bw(:)
+  INTEGER, SAVE  :: nijp
+  INTEGER, SAVE  :: dimref(4) = 0
+  INTEGER, SAVE  :: dimref_bw(4) = 0
+  !
+  LOGICAL :: use_tg_
+  !
+  CALL start_clock ('fft_scatter')
+
+  use_tg_ = .false.
+
+  IF( present( dtgs ) ) use_tg_ = .true.
+
+  me     = dfft%mype + 1
+  !
+  ncpx = 0
+  nppx = 0
+  IF( use_tg_ ) THEN
+     !  This is the number of procs. in the plane-wave group
+     nprocp = dtgs%npgrp
+     ncpx   = dtgs%tg_ncpx
+     nppx   = dtgs%tg_nppx
+     gcomm  = dtgs%pgrp_comm
+  ELSE
+     nprocp = dfft%nproc
+     DO proc = 1, nprocp
+        ncpx = max( ncpx, ncp_ ( proc ) )
+        nppx = max( nppx, npp_ ( proc ) )
+     ENDDO
+     IF ( dfft%nproc == 1 ) THEN
+        nppx = dfft%nr3x
+     END IF
+     gcomm = dfft%comm
+  ENDIF
+  ! 
+  sendsiz = ncpx * nppx
+  !
+  IF ( isgn .gt. 0 ) THEN
+     !
+     ! "forward" scatter from columns to planes
+     !
+     ! step one: store contiguously the slices
+     !
+     offset = 0
+
+     !
+     ! step two: receive with windows
+     !
+     ! intel mpi bug?
+     CALL MPI_TYPE_GET_EXTENT(MPI_DOUBLE_COMPLEX, lowerbound, mp_size, ierr)
+     !
+     call MPI_INFO_CREATE(info, ierr)
+     call MPI_INFO_SET(info, "same_size ", "true", ierr)
+     !print *, "mp_size,nxx_", mp_size,nxx_
+     CALL MPI_WIN_CREATE(f_aux, mp_size*nxx_,mp_size, info, gcomm, WIN, ierr)
+     call MPI_INFO_FREE(info, ierr)
+     !
+     CALL MPI_Win_fence(0, WIN, ierr)
+
+     IF( use_tg_ ) THEN
+        DO proc = 1, nprocp
+           gproc = dtgs%nplist(proc)+1
+           kdest = ( proc - 1 ) * sendsiz
+           kfrom = offset 
+           DO k = 1, ncp_ (me)
+              !DO i = 1, npp_ ( gproc )
+              !   f_aux ( kdest + i ) =  f_in ( kfrom + i )
+              !ENDDO
+              CALL MPI_Put(f_in ( kfrom + 1 ), npp_ ( gproc ), MPI_DOUBLE_COMPLEX, &
+                      proc-1, int((me-1)*sendsiz + (k-1)*nppx, MPI_ADDRESS_KIND), &
+                      npp_ ( gproc ), MPI_DOUBLE_COMPLEX, WIN, ierr)
+              kdest = kdest + nppx
+              kfrom = kfrom + nr3x
+           ENDDO
+           offset = offset + npp_ ( gproc )
+        ENDDO
+     ELSE
+        DO proc = 1, nprocp
+           kdest = ( proc - 1 ) * sendsiz
+           kfrom = offset 
+           DO k = 1, ncp_ (me)
+              !DO i = 1, npp_ ( proc )
+              !   f_aux ( kdest + i ) =  f_in ( kfrom + i )
+              !ENDDO
+              CALL MPI_Put(f_in ( kfrom + 1 ), npp_ ( proc ), MPI_DOUBLE_COMPLEX, &
+                      proc-1, int((me-1)*sendsiz + (k-1)*nppx, MPI_ADDRESS_KIND), &
+                      npp_ ( proc ), MPI_DOUBLE_COMPLEX, WIN, ierr)
+              kdest = kdest + nppx
+              kfrom = kfrom + nr3x
+           ENDDO
+           offset = offset + npp_ ( proc )
+        ENDDO
+     ENDIF
+     !
+     ! maybe useless; ensures that no garbage is present in the output
+     !
+     !f_in( nprocp*sendsiz + 1 : size( f_in )  ) = 0.0_DP
+     !
+     CALL MPI_Win_fence(0, WIN, ierr)
+     CALL MPI_WIN_FREE(WIN, ierr)
+     !
+     f_in  = f_aux
+     f_aux = (0.d0, 0.d0)
+     !
+     !
+     IF( isgn == 1 ) THEN
+
+        DO ip = 1, dfft%nproc
+           ioff = dfft%iss( ip )
+           it = ( ip - 1 ) * sendsiz
+           DO i = 1, dfft%nsp( ip )
+              mc = dfft%ismap( i + ioff )
+              DO j = 1, dfft%npp( me )
+                 f_aux( mc + ( j - 1 ) * dfft%nnp ) = f_in( j + it )
+              ENDDO
+              it = it + nppx
+           ENDDO
+        ENDDO
+
+     ELSE
+
+        IF( use_tg_ ) THEN
+           npp  = dtgs%tg_npp( me )
+           nnp  = dfft%nr1x * dfft%nr2x
+           nblk = dtgs%nproc / dtgs%nogrp
+           nsiz = dtgs%nogrp
+        ELSE
+           npp  = dfft%npp( me )
+           nnp  = dfft%nnp
+           nblk = dfft%nproc 
+           nsiz = 1
+        ENDIF
+        !
+        IF( ( dimref(1) .ne. npp ) .or. ( dimref(2) .ne. nnp ) .or. &
+            ( dimref(3) .ne. nblk ) .or. ( dimref(4) .ne. nsiz ) ) THEN
+           !
+           IF( ALLOCATED( indmap ) )  &
+              DEALLOCATE( indmap )
+           ALLOCATE( indmap(2,SIZE(f_aux)) )
+           !
+           ijp = 0
+           !
+           DO gproc = 1, nblk
+              ii = 0
+              DO ipp = 1, nsiz
+                 ioff = dfft%iss( (gproc-1)*nsiz + ipp )
+                 DO i = 1, dfft%nsw( (gproc-1)*nsiz + ipp )
+                    mc = dfft%ismap( i + ioff )
+                    it = ii * nppx + (gproc-1) * sendsiz
+                    DO j = 1, npp
+                       ijp = ijp + 1
+                       indmap(1,ijp) = mc + ( j - 1 ) * nnp
+                       indmap(2,ijp) = j + it 
+                    ENDDO
+                    ii = ii + 1
+                 ENDDO
+              ENDDO
+           ENDDO
+           !
+           nijp = ijp
+           CALL fftsort( nijp, indmap )
+           dimref(1) = npp
+           dimref(2) = nnp
+           dimref(3) = nblk
+           dimref(4) = nsiz
+           !
+        END IF
+        !
+        DO ijp = 1, nijp
+           f_aux( indmap(1,ijp) ) = f_in( indmap(2,ijp) )
+        END DO
+        !
+     END IF
+
+  ELSE
+     !
+     !  "backward" scatter from planes to columns
+     !
+     IF( isgn == -1 ) THEN
+
+        nblk = dfft%nproc 
+
+        DO ip = 1, dfft%nproc
+           ioff = dfft%iss( ip )
+           it = ( ip - 1 ) * sendsiz
+           DO i = 1, dfft%nsp( ip )
+              mc = dfft%ismap( i + ioff )
+              DO j = 1, dfft%npp( me )
+                 f_in( j + it ) = f_aux( mc + ( j - 1 ) * dfft%nnp )
+              ENDDO
+              it = it + nppx
+           ENDDO
+        ENDDO
+        !
+        CALL MPI_TYPE_GET_EXTENT(MPI_DOUBLE_COMPLEX, lowerbound, mp_size, ierr)
+        !
+        call MPI_INFO_CREATE(info, ierr)
+        call MPI_INFO_SET(info, "same_size ", "true", ierr)
+        !print *, "mp_size,nxx_", mp_size,nxx_
+        CALL MPI_WIN_CREATE(f_in, mp_size*nxx_,mp_size, info, gcomm, WIN, ierr)
+        call MPI_INFO_FREE(info, ierr)
+        !
+        CALL MPI_Win_fence(0, WIN, ierr)
+
+        DO ip = 1, dfft%nproc
+           !
+           TARGET_DISP = int(( me - 1 ) * sendsiz, MPI_ADDRESS_KIND)
+           !
+           CALL MPI_GET(f_aux( (ip-1)*sendsiz + 1 ),  sendsiz, MPI_DOUBLE_COMPLEX, &
+               ip-1, TARGET_DISP,  sendsiz, MPI_DOUBLE_COMPLEX, WIN, ierr)
+        ENDDO
+        !
+        CALL MPI_Win_fence(0, WIN, ierr)
+        CALL MPI_WIN_FREE(WIN, ierr)
+        !
+     ELSE
+
+        IF( use_tg_ ) THEN
+           npp  = dtgs%tg_npp( me )
+           nnp  = dfft%nr1x * dfft%nr2x
+           nblk = dtgs%nproc / dtgs%nogrp
+           nsiz = dtgs%nogrp
+        ELSE
+           npp  = dfft%npp( me )
+           nnp  = dfft%nnp
+           nblk = dfft%nproc 
+           nsiz = 1
+        ENDIF
+        !
+        IF( ( dimref_bw(1) .ne. npp ) .or. ( dimref_bw(2) .ne. nnp ) .or. &
+            ( dimref_bw(3) .ne. nblk ) .or. ( dimref_bw(4) .ne. nsiz ) ) THEN
+           !
+           IF( ALLOCATED( indmap_bw ) )  &
+              DEALLOCATE( indmap_bw )
+           !
+           ALLOCATE( indmap_bw(SIZE(f_aux)) )
+           !
+           ijp = 0
+           DO gproc = 1, nblk
+              ii = 0
+              DO ipp = 1, nsiz
+                 ioff = dfft%iss(  (gproc-1)*nsiz + ipp  )
+                 DO i = 1, dfft%nsw(  (gproc-1)*nsiz + ipp  )
+                    mc = dfft%ismap( i + ioff )
+                    it = ii * nppx + ( gproc - 1 ) * sendsiz
+                    DO j = 1, npp
+                       indmap_bw( j + ijp ) = mc + ( j - 1 ) * nnp
+                    ENDDO
+                    ijp = ijp + npp 
+                    ii = ii + 1
+                 ENDDO
+              ENDDO
+           ENDDO
+
+           dimref_bw(1) = npp
+           dimref_bw(2) = nnp
+           dimref_bw(3) = nblk
+           dimref_bw(4) = nsiz
+
+        END IF
+
+
+        ijp = 0
+        DO gproc = 0, nblk-1
+           ii = gproc * sendsiz
+           DO ipp = gproc*nsiz+1, gproc*nsiz+nsiz
+              DO i = 1, dfft%nsw(  ipp  )
+                 DO j = 1, npp
+                    f_in( j + ii ) = f_aux( indmap_bw( j + ijp ) )
+                 ENDDO
+                 ijp = ijp + npp
+                 ii = ii + nppx 
+              ENDDO
+           ENDDO
+        ENDDO
+        !
+        !
+        CALL MPI_TYPE_GET_EXTENT(MPI_DOUBLE_COMPLEX, lowerbound, mp_size, ierr)
+        !
+        call MPI_INFO_CREATE(info, ierr)
+        call MPI_INFO_SET(info, "same_size ", "true", ierr)
+        !print *, "mp_size,nxx_", mp_size,nxx_
+        CALL MPI_WIN_CREATE(f_in, mp_size*nxx_,mp_size, info, gcomm, WIN, ierr)
+        call MPI_INFO_FREE(info, ierr)
+        !
+        CALL MPI_Win_fence(0, WIN, ierr)
+        DO gproc = 1, nblk
+          TARGET_DISP = int(( me - 1 ) * sendsiz, MPI_ADDRESS_KIND)
+          !
+          CALL MPI_GET(f_aux( (gproc-1)*sendsiz + 1 ),  sendsiz, MPI_DOUBLE_COMPLEX, &
+             gproc-1, TARGET_DISP,  sendsiz, MPI_DOUBLE_COMPLEX, WIN, ierr)
+          !
+        ENDDO
+        !
+        CALL MPI_Win_fence(0, WIN, ierr)
+        CALL MPI_WIN_FREE(WIN, ierr)
+        !
+     END IF
+     !
+     offset = 0
+
+     IF( use_tg_ ) THEN
+        DO proc = 1, nprocp
+           gproc = dtgs%nplist(proc) + 1
+           kdest = ( proc - 1 ) * sendsiz
+           kfrom = offset 
+           DO k = 1, ncp_ (me)
+              DO i = 1, npp_ ( gproc )  
+                 f_in ( kfrom + i ) = f_aux ( kdest + i )
+              ENDDO
+              kdest = kdest + nppx
+              kfrom = kfrom + nr3x
+           ENDDO
+           offset = offset + npp_ ( gproc )
+        ENDDO
+     ELSE
+        DO proc = 1, nprocp
+           kdest = ( proc - 1 ) * sendsiz 
+           kfrom = offset 
+           DO k = 1, ncp_ (me)
+              DO i = 1, npp_ ( proc )  
+                 f_in ( kfrom + i ) = f_aux ( kdest + i )
+              ENDDO
+              kdest = kdest + nppx
+              kfrom = kfrom + nr3x
+           ENDDO
+           offset = offset + npp_ ( proc )
+        ENDDO
+     ENDIF
+
+  ENDIF
+
+  CALL stop_clock ('fft_scatter')
+
+#endif
+
+  RETURN
+
+END SUBROUTINE fft_scatter
+#endif 
+! RMAv2
+!
 #endif 
 ! __RMA_SCATTER
 !
